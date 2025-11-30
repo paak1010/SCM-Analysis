@@ -59,6 +59,7 @@ def get_product_details(_conn, product_id):
                 "price": details[3], "supplier": details[4], "contract_lead_time": details[5]}
     return None
 
+# [수정] _conn 인자에 언더스코어를 붙여 캐시 해시 계산에서 제외시킵니다.
 @st.cache_data
 def analyze_risk(_conn, product_id):
     # [핵심] 실제 납기일 계산 (Shipped - Order)
@@ -119,6 +120,7 @@ if conn:
     st.sidebar.title("🚀 Smart SCM")
     st.sidebar.markdown("**데이터 기반 공급망 리스크 관리**")
     
+    # [수정] 호출할 때도 _conn 인자를 명시적으로 전달하는 것이 좋습니다. (Streamlit 캐싱 동작 방식 때문)
     products = get_product_list(conn)
     selected_label = st.sidebar.selectbox("📦 분석 대상 제품", products['ProductName'] + " (ID:" + products['ProductID'].astype(str) + ")")
     pid = int(selected_label.split("ID:")[1].replace(")", ""))
