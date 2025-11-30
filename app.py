@@ -63,12 +63,16 @@ def get_product_details(_conn, product_id):
 @st.cache_data
 def analyze_risk(_conn, product_id):
     # [핵심] 실제 납기일 계산 (Shipped - Order)
-    # BinderException 방지: CAST(... AS TIMESTAMP)를 사용하여 데이터 타입을 명확히 지정
+    # 수정: CAST -> TRY_CAST 사용 (변환 실패 시 오류 대신 NULL 반환)
+    # 추가: 문자열 'NULL'이나 빈 값은 WHERE 절에서 미리 걸러냄
     query = f"""
     SELECT o.OrderDate, o.ShippedDate,
-           date_diff('day', CAST(o.OrderDate AS TIMESTAMP), CAST(o.ShippedDate AS TIMESTAMP)) as ActualLeadTime
+           date_diff('day', TRY_CAST(o.OrderDate AS TIMESTAMP), TRY_CAST(o.ShippedDate AS TIMESTAMP)) as ActualLeadTime
     FROM Order_Details od JOIN Orders o ON od.OrderID = o.OrderID
-    WHERE od.ProductID = {product_id} AND o.ShippedDate IS NOT NULL
+    WHERE od.ProductID = {product_id} 
+      AND o.ShippedDate IS NOT NULL 
+      AND o.ShippedDate != 'NULL' 
+      AND TRY_CAST(o.ShippedDate AS TIMESTAMP) IS NOT NULL
     ORDER BY o.OrderDate;
     """
     try:
