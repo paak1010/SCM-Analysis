@@ -3,12 +3,12 @@ import pandas as pd
 import os
 import streamlit as st
 import altair as alt
+import numpy as np
 
-# --- 1. Configuration ---
+# --- 1. 환경 설정 ---
 DB_FILE = 'scm.duckdb'
+st.set_page_config(page_title="Smart SCM: 리스크 최적화", layout="wide", page_icon="📦")
 
-# CSV files needed to create the DB
-# These must be in the GitHub repository
 TABLES_AND_CSVS = {
     'Suppliers': 'suppliers_data.csv',
     'Products': 'products_data.csv',
@@ -17,203 +17,194 @@ TABLES_AND_CSVS = {
     'Order_Details': 'order_details_data.csv'
 }
 
-# --- 2. Database Initialization (Crucial for Streamlit Cloud) ---
+# --- 2. 데이터베이스 초기화 ---
 def initialize_database():
-    """
-    Checks if the DuckDB file exists. If not, creates it from CSVs.
-    This runs ONCE when the Streamlit app starts on the server.
-    """
     if os.path.exists(DB_FILE):
-        return # DB file already exists
+        return
+    with st.spinner('시스템 초기화 중...'):
+        try:
+            conn = duckdb.connect(database=DB_FILE, read_only=False)
+            for table_name, csv_file in TABLES_AND_CSVS.items():
+                if os.path.exists(csv_file):
+                    conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM read_csv_auto('{csv_file}', header=True)")
+            conn.close()
+        except Exception as e:
+            st.error(f"초기화 오류: {e}")
 
-    print("--- Database not found. Creating from CSV files... ---")
-    try:
-        conn = duckdb.connect(database=DB_FILE, read_only=False)
-        
-        for table_name, csv_file in TABLES_AND_CSVS.items():
-            if not os.path.exists(csv_file):
-                # This error will show in the Streamlit logs
-                print(f"Error: Missing required file: {csv_file}")
-                st.error(f"Fatal Error: Missing CSV file {csv_file}. App cannot start.")
-                return
-            
-            # Create table from CSV
-            conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM read_csv_auto('{csv_file}', header=True)")
-            print(f"Successfully created table: {table_name}")
-
-        print("--- Database initialization complete. ---")
-        conn.close()
-
-    except Exception as e:
-        print(f"Error during DB initialization: {e}")
-        st.error(f"Database creation failed: {e}")
-
-# Run the initialization ONCE at the start
 initialize_database()
 
-
-# --- 3. Database Connection & Data Fetching (with Caching) ---
-
-# Use st.cache_resource to cache the database connection
+# --- 3. 데이터 조회 ---
 @st.cache_resource
 def get_db_connection():
-    """Gets a cached connection to the DuckDB file."""
     try:
-        conn = duckdb.connect(database=DB_FILE, read_only=True)
-        return conn
-    except Exception as e:
-        st.error(f"Failed to connect to DuckDB: {e}")
+        return duckdb.connect(database=DB_FILE, read_only=True)
+    except:
         return None
 
-# Use st.cache_data to cache the results of data queries
 @st.cache_data
-def get_all_products(_conn):
-    """Fetches all product names and IDs for the selector."""
-    try:
-        products_df = _conn.execute("SELECT ProductID, ProductName FROM Products ORDER BY ProductName").df()
-        return products_df
-    except Exception as e:
-        st.error(f"Error fetching product list: {e}")
-        return pd.DataFrame(columns=["ProductID", "ProductName"])
+def get_product_list(_conn):
+    return _conn.execute("SELECT ProductID, ProductName FROM Products ORDER BY ProductName").df()
 
 @st.cache_data
-def get_sales_history(_conn, product_id):
-    """Fetches and aggregates monthly sales for a specific product."""
+def get_product_details(_conn, product_id):
     query = f"""
-    SELECT 
-        strftime(o.OrderDate, '%Y-%m') AS SalesMonth,
-        SUM(od.Quantity) AS TotalQuantity
-    FROM Order_Details od
-    JOIN Orders o ON od.OrderID = o.OrderID
-    WHERE od.ProductID = {product_id}
-    GROUP BY SalesMonth
-    ORDER BY SalesMonth;
-    """
-    sales_df = _conn.execute(query).df()
-    # Ensure SalesMonth is a datetime object for charting
-    if not sales_df.empty:
-        sales_df['SalesMonth'] = pd.to_datetime(sales_df['SalesMonth'])
-    return sales_df
-
-@st.cache_data
-def get_product_analysis_details(_conn, product_id):
-    """Fetches all details needed for ROP calculation."""
-    query = f"""
-    SELECT 
-        p.ProductName,
-        p.StockQuantity,
-        p.SafetyStockLevel,
-        s.LeadTimeDays
-    FROM Products p
-    JOIN Suppliers s ON p.SupplierID = s.SupplierID
+    SELECT p.ProductName, p.StockQuantity, p.SafetyStockLevel, p.UnitPrice,
+           s.SupplierName, s.LeadTimeDays as ContractLeadTime
+    FROM Products p JOIN Suppliers s ON p.SupplierID = s.SupplierID
     WHERE p.ProductID = {product_id};
     """
     details = _conn.execute(query).fetchone()
     if details:
-        return {
-            "name": details[0],
-            "stock": details[1],
-            "safety_stock": details[2],
-            "lead_time": details[3]
-        }
+        return {"name": details[0], "stock": details[1], "safety_stock": details[2],
+                "price": details[3], "supplier": details[4], "contract_lead_time": details[5]}
     return None
 
-# --- 4. Analysis & Forecasting Logic ---
+@st.cache_data
+def analyze_risk(_conn, product_id):
+    # [핵심] 실제 납기일 계산 (Shipped - Order)
+    query = f"""
+    SELECT o.OrderDate, o.ShippedDate,
+           date_diff('day', o.OrderDate, o.ShippedDate) as ActualLeadTime
+    FROM Order_Details od JOIN Orders o ON od.OrderID = o.OrderID
+    WHERE od.ProductID = {product_id} AND o.ShippedDate IS NOT NULL
+    ORDER BY o.OrderDate;
+    """
+    df = _conn.execute(query).df()
+    if df.empty: return None
+    # 평균과 표준편차(변동성) 계산
+    return {"avg": df['ActualLeadTime'].mean(), "std": df['ActualLeadTime'].std() if len(df)>1 else 0}
 
-def calculate_rop(sales_df, details):
-    """Calculates ROP and provides analysis."""
-    if sales_df.empty:
-        return 0, 0, "판매 이력 없음"
+@st.cache_data
+def get_demand_data(_conn, product_id):
+    query = f"""
+    SELECT strftime(o.OrderDate, '%Y-%m') as Month, SUM(od.Quantity) as Qty
+    FROM Order_Details od JOIN Orders o ON od.OrderID = o.OrderID
+    WHERE od.ProductID = {product_id} GROUP BY Month ORDER BY Month
+    """
+    return _conn.execute(query).df()
 
-    avg_monthly_sales = sales_df['TotalQuantity'].mean()
-    avg_daily_demand = avg_monthly_sales / 30.0
+# --- 4. [핵심] 리스크 분석 및 최적화 로직 ---
+def run_optimization(sales_df, risk_data, details):
+    daily_demand = sales_df['Qty'].mean() / 30.0
     
-    lead_time = details["lead_time"]
-    safety_stock = details["safety_stock"]
-    
-    demand_during_lead_time = avg_daily_demand * lead_time
-    reorder_point = demand_during_lead_time + safety_stock
-    
-    return avg_daily_demand, reorder_point, "분석 완료"
+    # 리스크 요인 추출
+    contract_lt = details['contract_lead_time']
+    actual_lt = risk_data['avg']
+    lt_variance = risk_data['std'] # 납기 변동성
 
+    # [신뢰도 점수 로직]
+    # 납기가 늦거나(delay), 들쭉날쭉하면(variance) 점수 깎임
+    delay_penalty = max(0, actual_lt - contract_lt) * 10
+    variance_penalty = lt_variance * 5
+    score = max(0, 100 - (delay_penalty + variance_penalty))
 
-# --- 5. Streamlit App UI ---
+    # [AI 안전재고 추천 로직]
+    # Z값(1.65) * 변동성 * 수요
+    rec_safety_stock = int((daily_demand * actual_lt) + (1.65 * lt_variance * daily_demand))
+    rec_safety_stock = max(rec_safety_stock, int(daily_demand * 2))
 
-# Set page title and layout
-st.set_page_config(page_title="SCM 재고 관리 대시보드", layout="wide")
+    # 리스크 조정 ROP
+    risk_adjusted_rop = (daily_demand * actual_lt) + rec_safety_stock
 
-# Get DB connection
+    return {
+        "daily_demand": daily_demand, "score": score,
+        "rec_safety_stock": rec_safety_stock, "rop": risk_adjusted_rop,
+        "actual_lt": actual_lt, "variance": lt_variance
+    }
+
+# --- 5. UI 대시보드 ---
 conn = get_db_connection()
 
-if conn is None:
-    st.error("데이터베이스 연결에 실패했습니다. 앱을 재시작해주세요.")
-else:
-    # --- Sidebar ---
-    st.sidebar.title("SCM Dashboard")
-    st.sidebar.image("https://placehold.co/400x200/06B6D4/FFFFFF?text=SCM+Model", use_column_width=True)
+if conn:
+    st.sidebar.title("🚀 Smart SCM")
+    st.sidebar.markdown("**데이터 기반 공급망 리스크 관리**")
     
-    product_list_df = get_all_products(conn)
+    products = get_product_list(conn)
+    selected_label = st.sidebar.selectbox("📦 분석 대상 제품", products['ProductName'] + " (ID:" + products['ProductID'].astype(str) + ")")
+    pid = int(selected_label.split("ID:")[1].replace(")", ""))
     
-    # Create a mapping from "Name (ID)" to just ID
-    product_options = {f"{row.ProductName} (ID: {row.ProductID})": row.ProductID for index, row in product_list_df.iterrows()}
-    
-    selected_option = st.sidebar.selectbox(
-        "분석할 제품을 선택하세요:",
-        options=list(product_options.keys())
-    )
-    
-    # Get the ID from the selected option
-    selected_product_id = product_options[selected_option]
+    # 데이터 로드
+    details = get_product_details(conn, pid)
+    risk_data = analyze_risk(conn, pid)
+    sales_data = get_demand_data(conn, pid)
 
-    # --- Main Page ---
-    st.title(f"📈 SCM 수요 예측 및 재고 분석")
-    st.markdown(f"현재 선택된 제품: **{selected_option}**")
-    
-    # --- Fetch data for the selected product ---
-    details = get_product_analysis_details(conn, selected_product_id)
-    sales_history_df = get_sales_history(conn, selected_product_id)
-    
-    if details is None:
-        st.error("제품 상세 정보를 불러오는 데 실패했습니다.")
-    else:
-        # --- Run analysis ---
-        avg_daily_demand, reorder_point, status = calculate_rop(sales_history_df, details)
+    # 상단 정보
+    st.title(f"{details['name']} 리스크 분석")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("현재 재고", f"{details['stock']}개")
+    col2.metric("공급업체", details['supplier'])
+    col3.metric("계약 납기", f"{details['contract_lead_time']}일")
+    col4.metric("단가", f"${details['price']}")
+    st.divider()
+
+    if risk_data and not sales_data.empty:
+        res = run_optimization(sales_data, risk_data, details)
         
-        # --- Display Key Metrics ---
-        st.header("📊 핵심 재고 지표 (KPIs)")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("현재 재고 (Stock)", f"{details['stock']} 개")
-        col2.metric("안전 재고 (Safety Stock)", f"{details['safety_stock']} 개")
-        col3.metric("공급자 리드타임 (Lead Time)", f"{details['lead_time']} 일")
+        # 탭 1: 리스크 진단 (여기에 빨간색 점수와 경고가 나옵니다!)
+        st.subheader("1️⃣ 공급업체 신뢰도 평가")
+        
+        score = res['score']
+        # 점수에 따라 색상 결정 (60점 미만이면 빨간색)
+        color = "red" if score < 60 else "orange" if score < 80 else "green"
+        
+        c1, c2 = st.columns([1, 2])
+        
+        # [신뢰도 점수 카드]
+        with c1:
+            st.markdown(f"""
+                <div style="text-align: center; border: 2px solid {color}; padding: 20px; border-radius: 10px;">
+                    <h2 style="color: {color}; margin:0;">{score:.0f}점</h2>
+                    <p style="margin:0;">신뢰도 점수</p>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            # [경고 메시지] 점수가 낮으면 경고 출력
+            if score < 80:
+                delay_days = res['actual_lt'] - details['contract_lead_time']
+                st.error(f"⚠️ **위험 감지**: 약속보다 평균 **{delay_days:.1f}일** 지연되고 있습니다.")
+        
+        # [비교 차트]
+        with c2:
+            chart_data = pd.DataFrame({
+                'Type': ['계약 납기', '실제 납기(평균)'],
+                'Days': [details['contract_lead_time'], res['actual_lt']]
+            })
+            c = alt.Chart(chart_data).mark_bar().encode(
+                x='Days', y=alt.Y('Type', title=None),
+                color=alt.Color('Type', scale=alt.Scale(range=['gray', color]), legend=None)
+            ).properties(height=150)
+            st.altair_chart(c, use_container_width=True)
 
         st.divider()
 
-        # --- Display Analysis Result ---
-        st.header("💡 분석 결과: 재주문점 (ROP)")
+        # 탭 2: 최적화 제안
+        st.subheader("2️⃣ 재고 최적화 제안")
         
-        col_rop, col_demand = st.columns(2)
-        col_rop.metric("계산된 재주문점 (Reorder Point)", f"{reorder_point:.1f} 개")
-        col_demand.metric("예측 일평균 수요 (Daily Demand)", f"{avg_daily_demand:.1f} 개/일")
-
-        # --- Final Verdict ---
-        current_stock = details['stock']
-        if current_stock < reorder_point:
-            st.error(f"**[조치 필요]** 현재 재고({current_stock})가 재주문점({reorder_point:.1f})보다 낮습니다. **즉시 발주가 필요합니다!**")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("기존 설정 안전재고", f"{details['safety_stock']}개")
+        m2.metric("AI 제안 안전재고", f"{res['rec_safety_stock']}개", f"{res['rec_safety_stock'] - details['safety_stock']}개 조정")
+        
+        cost = (details['safety_stock'] - res['rec_safety_stock']) * details['price']
+        if cost > 0:
+            m3.metric("예상 절감 비용", f"${cost:,.0f}")
+            st.success("💡 현재 재고가 과다합니다. 안전재고를 줄이세요.")
+        elif cost < 0:
+            m3.metric("추가 투자 필요", f"${abs(cost):,.0f}")
+            st.error("🚨 품절 위험이 높습니다. 안전재고를 늘리세요.")
         else:
-            st.success(f"**[양호]** 현재 재고({current_stock})가 재주문점({reorder_point:.1f})보다 많습니다. 재고가 충분합니다.")
+            m3.metric("상태", "최적")
+            st.info("현재 설정이 최적입니다.")
 
-        # --- Display Sales History Chart ---
-        st.header("📉 과거 판매 이력 (월별)")
-        if not sales_history_df.empty:
-            # Create an Altair chart
-            chart = alt.Chart(sales_history_df).mark_bar(color="#06B6D4").encode(
-                x=alt.X('SalesMonth', title='월'),
-                y=alt.Y('TotalQuantity', title='총 판매량'),
-                tooltip=['SalesMonth', 'TotalQuantity']
-            ).properties(
-                title=f"{details['name']} 월별 판매량"
-            ).interactive()
-            
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            st.warning("이 제품은 아직 판매 이력이 없습니다.")
+        # 탭 3: 시뮬레이션
+        st.subheader("3️⃣ 미래 재고 시뮬레이션")
+        days = range(30)
+        stock_flow = [max(0, details['stock'] - (res['daily_demand'] * d)) for d in days]
+        sim_df = pd.DataFrame({'Day': days, 'Stock': stock_flow})
+        
+        line = alt.Chart(sim_df).mark_line().encode(x='Day', y='Stock')
+        rule = alt.Chart(pd.DataFrame({'y': [res['rop']]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
+        
+        st.altair_chart(line + rule, use_container_width=True)
+
+    else:
+        st.warning("분석할 데이터가 부족합니다.")
