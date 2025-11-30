@@ -63,17 +63,23 @@ def get_product_details(_conn, product_id):
 @st.cache_data
 def analyze_risk(_conn, product_id):
     # [핵심] 실제 납기일 계산 (Shipped - Order)
+    # BinderException 방지: CAST(... AS TIMESTAMP)를 사용하여 데이터 타입을 명확히 지정
     query = f"""
     SELECT o.OrderDate, o.ShippedDate,
-           date_diff('day', o.OrderDate, o.ShippedDate) as ActualLeadTime
+           date_diff('day', CAST(o.OrderDate AS TIMESTAMP), CAST(o.ShippedDate AS TIMESTAMP)) as ActualLeadTime
     FROM Order_Details od JOIN Orders o ON od.OrderID = o.OrderID
     WHERE od.ProductID = {product_id} AND o.ShippedDate IS NOT NULL
     ORDER BY o.OrderDate;
     """
-    df = _conn.execute(query).df()
-    if df.empty: return None
-    # 평균과 표준편차(변동성) 계산
-    return {"avg": df['ActualLeadTime'].mean(), "std": df['ActualLeadTime'].std() if len(df)>1 else 0}
+    try:
+        df = _conn.execute(query).df()
+        if df.empty: return None
+        # 평균과 표준편차(변동성) 계산
+        return {"avg": df['ActualLeadTime'].mean(), "std": df['ActualLeadTime'].std() if len(df)>1 else 0}
+    except Exception as e:
+        # 오류 발생 시 구체적인 메시지를 UI에 표시 (디버깅용)
+        st.error(f"데이터 분석 오류 (analyze_risk): {e}")
+        return None
 
 @st.cache_data
 def get_demand_data(_conn, product_id):
